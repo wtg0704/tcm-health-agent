@@ -39,7 +39,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="中医AI健康顾问",
+    title="中医AI健康Agent系统",
     description="基于RAG+Agent的中医养生知识智能助手",
     version="1.0.0",
     lifespan=lifespan,
@@ -293,4 +293,4 @@ def get_chat_history(user_id: str, limit: int = 20, db: Session = Depends(get_db
 
 @app.get("/api/health")
 def health_check():
-    return {"status": "ok", "service": "中医AI健康顾问", "version": "1.0.0"}
+    return {"status": "ok", "service": "中医AI健康Agent系统", "version": "1.0.0"}

@@ -1,4 +1,4 @@
-# 中医AI健康顾问 (TCM Health AI Agent)
+# 中医AI健康Agent系统 (TCM Health AI Agent)
 
 基于RAG+LangGraph的中医体质辨识与养生知识智能助手。
 

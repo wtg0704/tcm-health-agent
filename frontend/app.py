@@ -1,4 +1,4 @@
-"""Streamlit前端 - 中医AI健康顾问 侧边栏常驻修复版"""
+"""Streamlit前端 - 中医AI健康Agent系统 侧边栏常驻修复版"""
 import streamlit as st
 import requests
 import plotly.graph_objects as go
@@ -11,7 +11,7 @@ BACKEND_URL = "http://localhost:8000"
 USER_FILE = os.path.join(os.path.dirname(__file__), "..", "user_data.json")
 
 st.set_page_config(
-    page_title="中医AI健康顾问",
+    page_title="中医AI健康Agent系统",
     page_icon="🌿",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -257,7 +257,7 @@ CONSTITUTION_DATA = {
 
 # ==================== 侧边栏 ====================
 with st.sidebar:
-    st.markdown("## 🌿 中医AI健康顾问")
+    st.markdown("## 🌿 中医AI健康Agent系统")
     st.divider()
 
     # 新对话
@@ -342,7 +342,7 @@ uid = st.session_state.user_id
 if not uid:
     st.markdown("""
     <div style="text-align:center; padding:100px 20px;">
-        <h1>🌿 中医AI健康顾问</h1>
+        <h1>🌿 中医AI健康Agent系统</h1>
         <p style="color:#666; font-size:18px;">基于 RAG + LangGraph Agent 的中医养生知识助手</p>
         <p style="color:#999;">👈 请在左侧创建账号，解锁全部功能</p>
     </div>
