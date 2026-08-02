@@ -1,0 +1,72 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16  # 含向量扩展，为后续Milvus迁移做准备
+    container_name: tcm_postgres
+    environment:
+      POSTGRES_USER: tcm_user
+      POSTGRES_PASSWORD: tcm_pass
+      POSTGRES_DB: tcm_health
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tcm_user -d tcm_health"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  chroma:
+    image: chromadb/chroma:latest
+    container_name: tcm_chroma
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: tcm_backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://tcm_user:tcm_pass@postgres:5432/tcm_health
+      - CHROMA_HOST=chroma
+      - CHROMA_PORT=8000
+      - LLM_PROVIDER=${LLM_PROVIDER:-deepseek}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://host.docker.internal:11434}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      chroma:
+        condition: service_started
+    volumes:
+      - ./data:/app/data
+      - ./prompts:/app/prompts
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+    container_name: tcm_frontend
+    ports:
+      - "8501:8501"
+    environment:
+      - BACKEND_URL=http://backend:8000
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/app/frontend
+
+volumes:
+  pg_data:
+  chroma_data:

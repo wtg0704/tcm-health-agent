@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# 环境
+.env
+.venv/
+venv/
+
+# Chroma向量库数据
+chroma_db/
+
+# SQLite数据库（含用户数据）
+*.db
+
+# 用户数据
+user_data.json
+
+# 工具脚本（非项目代码）
+export_word.py
+
+# IDE
+.vscode/
+.idea/
+
+# Docker
+pg_data/
+
+# OS
+.DS_Store
+Thumbs.db
