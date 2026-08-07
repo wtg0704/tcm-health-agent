@@ -157,17 +157,38 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==================== 数据持久化 ====================
-def load_user_id():
+def _load_user_data():
+    """从文件加载用户数据（user_id + 会话列表）"""
     if os.path.exists(USER_FILE):
         try:
             with open(USER_FILE, "r", encoding="utf-8") as f:
-                return json.load(f).get("user_id")
-        except: pass
-    return None
+                return json.load(f)
+        except:
+            pass
+    return {}
+
+def _save_user_data(data: dict):
+    """保存用户数据到文件"""
+    with open(USER_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def load_user_id():
+    return _load_user_data().get("user_id")
 
 def save_user_id(uid):
-    with open(USER_FILE, "w", encoding="utf-8") as f:
-        json.dump({"user_id": uid}, f)
+    d = _load_user_data()
+    d["user_id"] = uid
+    _save_user_data(d)
+
+def load_chat_sessions():
+    """加载已归档的对话会话"""
+    return _load_user_data().get("chat_sessions", [])
+
+def save_chat_sessions(sessions):
+    """持久化会话列表"""
+    d = _load_user_data()
+    d["chat_sessions"] = sessions
+    _save_user_data(d)
 
 # ==================== Session初始化 ====================
 def init_session():
@@ -178,6 +199,8 @@ def init_session():
         st.session_state.user_id = saved
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
+    if "chat_sessions" not in st.session_state:
+        st.session_state.chat_sessions = load_chat_sessions()
     if "constitution_type" not in st.session_state:
         st.session_state.constitution_type = None
     if "user_basic_info" not in st.session_state:
@@ -186,18 +209,72 @@ def init_session():
 init_session()
 
 # ==================== API ====================
-def api_call(method, path, data=None):
+@st.cache_data(ttl=600, show_spinner=False)
+def _cached_get(path, params_json=""):
+    """缓存 GET 请求——不变的数据不重复调 API"""
+    import json as _json
+    params = _json.loads(params_json) if params_json else None
     url = f"{BACKEND_URL}{path}"
     try:
-        if method == "GET":
-            resp = requests.get(url, params=data, timeout=30)
-        else:
-            params = {}
-            if data and "user_id" in data:
-                params["user_id"] = data["user_id"]
-            resp = requests.post(url, json=data, params=params, timeout=60)
+        resp = requests.get(url, params=params, timeout=30)
         return resp.json() if resp.status_code == 200 else None
-    except: return None
+    except:
+        return None
+
+
+def api_call(method, path, data=None):
+    """通用 API 调用，GET 请求走缓存"""
+    if method == "GET":
+        import json as _json
+        return _cached_get(path, _json.dumps(data, sort_keys=True) if data else "")
+    url = f"{BACKEND_URL}{path}"
+    try:
+        params = {}
+        if data and "user_id" in data:
+            params["user_id"] = data["user_id"]
+        resp = requests.post(url, json=data, params=params, timeout=60)
+        return resp.json() if resp.status_code == 200 else None
+    except:
+        return None
+
+
+def _stream_tokens(user_id, message, history, metadata_container):
+    """调用流式API，逐个token产出。metadata_container 用来回传 sources/agent_trace"""
+    # 立即给出反馈——避免等待期间的"卡住了"错觉
+    yield "⏳ 正在分析您的问题…\n\n"
+
+    try:
+        response = requests.post(
+            f"{BACKEND_URL}/api/chat/stream",
+            json={
+                "user_id": user_id,
+                "message": message,
+                "conversation_history": history,
+            },
+            stream=True,
+            timeout=120,
+        )
+        if response.status_code != 200:
+            yield f"抱歉，请求失败（{response.status_code}）"
+            return
+
+        for line in response.iter_lines():
+            if line:
+                line_str = line.decode()
+                if line_str.startswith("data: "):
+                    try:
+                        data = json.loads(line_str[6:])
+                    except json.JSONDecodeError:
+                        continue
+                    if data.get("type") == "token":
+                        yield data["content"]
+                    elif data.get("type") == "done":
+                        metadata_container["sources"] = data.get("sources", [])
+                        metadata_container["agent_trace"] = data.get("agent_trace", {})
+    except requests.exceptions.ConnectionError:
+        yield "抱歉，无法连接后端服务。请确认后端已启动。"
+    except Exception as e:
+        yield f"抱歉，发生错误：{str(e)}"
 
 
 # ==================== 可视化 ====================
@@ -262,6 +339,18 @@ with st.sidebar:
 
     # 新对话
     if st.button("➕ 新对话", use_container_width=True):
+        # 归档当前会话（非空才保存）
+        if st.session_state.chat_history:
+            first_user_msg = next(
+                (m["message"] for m in st.session_state.chat_history if m["role"] == "user"),
+                "空对话"
+            )
+            session_title = first_user_msg[:30] + ("…" if len(first_user_msg) > 30 else "")
+            st.session_state.chat_sessions.insert(0, {
+                "title": session_title,
+                "messages": list(st.session_state.chat_history),  # 深拷贝
+            })
+            save_chat_sessions(st.session_state.chat_sessions)
         st.session_state.chat_history = []
         st.session_state.current_page = "chat"
         st.rerun()
@@ -284,25 +373,17 @@ with st.sidebar:
 
     # 历史对话
     st.markdown("#### 💬 历史对话")
-    uid = st.session_state.user_id
-    if uid:
-        raw = api_call("GET", "/api/chat/history", {"user_id": uid, "limit": 20})
-        if raw and raw.get("messages"):
-            msgs = [m for m in raw["messages"] if m["role"] == "user"]
-            shown = set()
-            count = 0
-            for m in reversed(msgs):
-                txt = m["message"]
-                preview = txt[:20] + "..." if len(txt) > 20 else txt
-                if preview not in shown and count < 12:
-                    shown.add(preview); count += 1
-                    if st.button(f"📝 {preview}", key=f"hist_{count}", use_container_width=True):
-                        st.session_state.current_page = "chat"
-                        st.rerun()
-        else:
-            st.caption("暂无对话记录")
+    if st.session_state.chat_sessions:
+        for i, session in enumerate(st.session_state.chat_sessions[:12]):
+            preview = session["title"][:20]
+            if len(session["title"]) > 20:
+                preview += "…"
+            if st.button(f"📝 {preview}", key=f"hist_{i}", use_container_width=True):
+                st.session_state.chat_history = list(session["messages"])
+                st.session_state.current_page = "chat"
+                st.rerun()
     else:
-        st.caption("登录后查看历史")
+        st.caption("暂无对话记录")
     st.divider()
 
     # 个人中心
@@ -320,8 +401,8 @@ with st.sidebar:
             if bi.get("bmi_val"):
                 st.caption(f"BMI：{bi['bmi_val']:.1f}（{bi['bmi_level']}）")
         if st.button("退出登录", use_container_width=True):
-            for k in ["user_id","chat_history","constitution_type","user_basic_info"]:
-                st.session_state[k] = None if k == "user_id" else ([] if k == "chat_history" else ({} if k == "user_basic_info" else None))
+            for k in ["user_id","chat_history","chat_sessions","constitution_type","user_basic_info"]:
+                st.session_state[k] = None if k == "user_id" else ([] if k in ("chat_history","chat_sessions") else ({} if k == "user_basic_info" else None))
             if os.path.exists(USER_FILE): os.remove(USER_FILE)
             st.rerun()
     else:
@@ -399,25 +480,33 @@ else:
         st.divider()
         inp = st.chat_input("输入您的中医养生问题...")
         if inp:
+            # 立即记录用户消息
             st.session_state.chat_history.append({"role": "user", "message": inp})
+
+            # 构建发给API的历史（不含刚加入的用户消息）
             api_hist = [
                 {"role": h["role"], "message": h["message"] if h["role"] == "user" else h["answer"]}
                 for h in st.session_state.chat_history[-7:-1]
             ]
-            with st.spinner("思考中..."):
-                resp = api_call("POST", "/api/chat/query", {
-                    "user_id": uid, "message": inp, "conversation_history": api_hist
-                })
-            if resp:
-                st.session_state.chat_history.append({
-                    "role": "assistant", "answer": resp["answer"],
-                    "sources": resp.get("sources", []),
-                })
-            else:
-                st.session_state.chat_history.append({
-                    "role": "assistant",
-                    "answer": "抱歉，服务暂不可用。请确认后端已启动且API Key已配置。"
-                })
+
+            # 流式输出——打字机效果
+            metadata = {}  # 回传 sources / agent_trace
+            with st.chat_message("assistant", avatar="🌿"):
+                full_answer = st.write_stream(
+                    _stream_tokens(uid, inp, api_hist, metadata)
+                )
+
+            # 去掉思考提示前缀（不影响用户看到的流式效果）
+            thinking_prefix = "⏳ 正在分析您的问题…\n\n"
+            if full_answer.startswith(thinking_prefix):
+                full_answer = full_answer[len(thinking_prefix):]
+
+            # 保存完整回复到历史
+            st.session_state.chat_history.append({
+                "role": "assistant",
+                "answer": full_answer,
+                "sources": metadata.get("sources", []),
+            })
             st.rerun()
 
     # ==================== 体质辨识 ====================

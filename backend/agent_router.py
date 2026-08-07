@@ -352,3 +352,135 @@ def run_agent(user_id: str, message: str, conversation_history: List[Dict] = Non
         "agent_trace": result["agent_trace"],
         "disclaimer": "⚠️ 以上为养生参考建议，不构成医疗诊断。如有身体不适，请及时前往正规医院就诊。",
     }
+
+
+# ========== 流式输出支持 ==========
+
+def _build_llm_messages(state: AgentState):
+    """构建LLM调用的消息列表，与 generate_answer 节点逻辑一致"""
+    results = state.get("retrieval_results", [])
+    constitution = state.get("constitution", {})
+    profile = state.get("user_profile", {})
+
+    context = get_retrieval_context(results)
+
+    # 构建用户信息提示
+    user_info = ""
+    if constitution:
+        user_info += f"\n用户体质类型：{constitution.get('type', '未知')}"
+    if profile:
+        bmi = profile.get("bmi", "")
+        bmi_str = f"{bmi:.1f}" if bmi else "未录入"
+        user_info += f"\n身高：{profile.get('height_cm', '未录入')}cm"
+        user_info += f"\n体重：{profile.get('weight_kg', '未录入')}kg"
+        user_info += f"\nBMI：{bmi_str}"
+    if not user_info:
+        user_info = "\n（用户尚未完成体质辨识和健康画像，可建议其先完成问卷）"
+
+    system_prompt = load_system_prompt() + f"\n\n## 当前用户信息{user_info}"
+
+    if context and context != "（知识库中未找到相关信息）":
+        augmented_message = HumanMessage(
+            content=f"请基于以下知识库内容回答问题：\n\n{context}\n\n用户问题：{state['messages'][-1].content}"
+        )
+        return [HumanMessage(content=system_prompt), augmented_message]
+    else:
+        return [HumanMessage(content=system_prompt), state["messages"][-1]]
+
+
+def run_agent_stream(user_id: str, message: str, conversation_history: List[Dict] = None):
+    """流式执行Agent——逐token返回，供SSE推流使用。
+
+    不走LangGraph完整图，而是手动串联 classify→retrieve_user→search→LLM.stream→save，
+    好处是生成阶段可以用 ChatOpenAI.stream() 逐token产出，实现打字机效果。
+
+    Yields:
+        {"type": "token", "content": "文"}   # 增量token
+        {"type": "done", "sources": [...], "agent_trace": {...}}  # 结束标记+元数据
+    """
+    # ---- Step 1: 构建消息列表（与 run_agent 保持一致）----
+    messages = []
+    if conversation_history:
+        for h in conversation_history[-6:]:  # 最近3轮
+            if h["role"] == "user":
+                messages.append(HumanMessage(content=h["message"]))
+            else:
+                messages.append(AIMessage(content=h["message"]))
+    messages.append(HumanMessage(content=message))
+
+    # ---- Step 2: 意图识别 ----
+    state: AgentState = {
+        "messages": messages,
+        "user_id": user_id,
+        "intent": "",
+        "searched_collections": [],
+        "tools_called": [],
+        "retrieval_results": [],
+        "user_profile": {},
+        "constitution": {},
+        "final_answer": "",
+        "sources": [],
+        "agent_trace": {},
+    }
+    state = intent_classifier(state)
+
+    # ---- Step 3: 医疗意图直接拒绝（非流式）----
+    if state["intent"] == "medical_reject":
+        state = medical_reject(state)
+        save_chat_history(state)
+        yield {"type": "token", "content": state["final_answer"]}
+        yield {
+            "type": "done",
+            "sources": [],
+            "agent_trace": state.get("agent_trace", {}),
+        }
+        return
+
+    # ---- Step 4: 获取用户画像 ----
+    state = retrieve_user_data(state)
+
+    # ---- Step 5: 知识库检索 ----
+    state = search_tools(state)
+
+    # ---- Step 6: 构建LLM消息 ----
+    llm_messages = _build_llm_messages(state)
+
+    # ---- Step 7: 流式调用LLM ----
+    llm = get_llm()
+    full_response = ""
+    try:
+        for chunk in llm.stream(llm_messages):
+            token = chunk.content
+            if token:  # 过滤空chunk
+                full_response += token
+                yield {"type": "token", "content": token}
+    except Exception as e:
+        error_msg = f"\n\n[生成中断: {str(e)}]"
+        full_response += error_msg
+        yield {"type": "token", "content": error_msg}
+
+    # ---- Step 8: 追加免责声明 ----
+    final_answer = wrap_disclaimer(full_response)
+    disclaimer_suffix = final_answer[len(full_response):]
+    if disclaimer_suffix:
+        yield {"type": "token", "content": disclaimer_suffix}
+
+    # ---- Step 9: 保存对话记录 ----
+    state["final_answer"] = final_answer
+    state["sources"] = [
+        {"doc": r["doc"], "excerpt": r["excerpt"][:200]}
+        for r in state.get("retrieval_results", [])
+    ]
+    state["agent_trace"] = {
+        "intent": state["intent"],
+        "searched_collections": state.get("searched_collections", []),
+        "tools_called": state.get("tools_called", []),
+    }
+    save_chat_history(state)
+
+    # ---- Step 10: 推送完成信号 ----
+    yield {
+        "type": "done",
+        "sources": state["sources"],
+        "agent_trace": state["agent_trace"],
+    }

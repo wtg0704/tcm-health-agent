@@ -1,6 +1,8 @@
 """FastAPI入口：路由注册、CORS、启动事件"""
+import json
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from typing import List
 from datetime import datetime
@@ -17,7 +19,7 @@ from .schemas import (
 )
 from .constitution import calculate_constitution, get_questions
 from .rag_pipeline import init_all_vectorstores
-from .agent_router import run_agent
+from .agent_router import run_agent, run_agent_stream
 
 from contextlib import asynccontextmanager
 
@@ -265,6 +267,41 @@ def chat_query(req: ChatQueryRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"处理请求失败: {str(e)}")
+
+
+# ==================== 流式知识问答（SSE） ====================
+
+@app.post("/api/chat/stream")
+def chat_stream(req: ChatQueryRequest):
+    """流式知识问答接口——逐token推送SSE事件，实现打字机效果"""
+    # 检查用户是否存在
+    db = SessionLocal()
+    user = db.query(User).filter(User.id == req.user_id).first()
+    db.close()
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在，请先创建用户")
+
+    # 构建对话历史
+    history = []
+    if req.conversation_history:
+        history = [
+            {"role": h.role, "message": h.message}
+            for h in req.conversation_history
+        ]
+
+    def generate():
+        """SSE事件生成器"""
+        for event in run_agent_stream(req.user_id, req.message, history):
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # 禁用nginx缓冲
+        },
+    )
 
 
 # ==================== 对话历史 ====================

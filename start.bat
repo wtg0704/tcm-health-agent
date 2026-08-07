@@ -5,10 +5,10 @@ echo ========================================
 echo.
 
 echo [1/2] 启动后端（新窗口，首次约30-60秒加载模型）...
-start "后端-API服务" cmd /k "mode con cols=100 lines=20 && cd /d E:\yuyi-cc\tcm_health_agent && python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000"
+start "后端-API服务" cmd /k "cd /d E:\yuyi-cc\tcm_health_agent && python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000"
 
 echo [2/2] 启动前端（新窗口）...
-start "前端-用户界面" cmd /k "mode con cols=100 lines=20 && cd /d E:\yuyi-cc\tcm_health_agent && python -m streamlit run frontend/app.py --server.port 8501 --server.headless true"
+start "前端-用户界面" cmd /k "cd /d E:\yuyi-cc\tcm_health_agent && python -m streamlit run frontend/app.py --server.port 8501 --server.headless true"
 
 echo.
 echo 启动完成！
