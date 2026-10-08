@@ -69,9 +69,10 @@ class SourceItem(BaseModel):
 
 
 class AgentTrace(BaseModel):
-    intent: str
-    searched_collections: List[str]
-    tools_called: List[str]
+    mode: Optional[str] = None  # function_calling（新版）/ 兼容旧数据
+    intent: Optional[str] = None  # 旧版关键词路由的意图标签，保留兼容
+    searched_collections: List[str] = Field(default_factory=list)
+    tools_called: List[str] = Field(default_factory=list)
 
 
 class ChatQueryResponse(BaseModel):
@@ -95,12 +96,33 @@ class ChatHistoryResponse(BaseModel):
     messages: List[HistoryItem]
 
 
+# ========== 多模态视觉分析 ==========
+
+class VisionRequest(BaseModel):
+    user_id: str
+    image_data_url: str = Field(..., min_length=1, description="图片 data URL（data:image/xxx;base64,...）")
+    task: str = Field("tongue", description="任务类型：tongue=舌诊, report=体检报告")
+    message: Optional[str] = Field("", description="用户补充说明（可选）")
+
+
+class VisionResponse(BaseModel):
+    answer: str
+    task: str
+    disclaimer: str
+
+
 # ========== 通用 ==========
 
 class UserCreateRequest(BaseModel):
     name: Optional[str] = None
+    password: Optional[str] = None
     gender: Optional[str] = None
     birth_date: Optional[str] = None
+
+
+class LoginRequest(BaseModel):
+    name: str = Field(..., min_length=1, description="账号昵称")
+    password: str = Field(..., min_length=1, description="登录密码")
 
 
 class UserResponse(BaseModel):

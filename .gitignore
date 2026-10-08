@@ -32,3 +32,8 @@ pg_data/
 # OS
 .DS_Store
 Thumbs.db
+
+# 本地笔记/规划文档（不上传 GitHub）
+AI应用记忆管理四层架构.md
+UPGRADE_PLAN.md
+优化记录-2026-08-08.md

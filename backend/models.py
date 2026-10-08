@@ -29,6 +29,7 @@ class User(Base):
 
     id = Column(UUIDType, primary_key=True, default=generate_uuid)
     name = Column(String(50), nullable=True)
+    password = Column(String(128), nullable=True)  # sha256 哈希，不存明文
     gender = Column(String(10), nullable=True)
     birth_date = Column(Date, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)

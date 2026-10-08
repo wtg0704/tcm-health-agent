@@ -1,11 +1,16 @@
 """FastAPI入口：路由注册、CORS、启动事件"""
+import hashlib
 import json
-from fastapi import FastAPI, Depends, HTTPException
+import threading
+import time
+from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from typing import List
 from datetime import datetime
+
+from .observability import get_logger
 
 from .config import DATA_DIR
 from .database import get_db, init_db, SessionLocal
@@ -15,11 +20,13 @@ from .schemas import (
     ProfileUpdateRequest, ProfileResponse,
     ChatQueryRequest, ChatQueryResponse, ChatMessage,
     ChatHistoryResponse, HistoryItem,
-    UserCreateRequest, UserResponse,
+    UserCreateRequest, UserResponse, LoginRequest,
+    VisionRequest, VisionResponse,
 )
 from .constitution import calculate_constitution, get_questions
-from .rag_pipeline import init_all_vectorstores
+from .rag_pipeline import ensure_loaded
 from .agent_router import run_agent, run_agent_stream
+from .vision import analyze_image, VISION_DISCLAIMER
 
 from contextlib import asynccontextmanager
 
@@ -29,12 +36,10 @@ async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     print("正在初始化数据库...")
     init_db()
-    print("正在加载知识库（后台进行）...")
-    try:
-        init_all_vectorstores()
-        print("知识库加载完成！")
-    except Exception as e:
-        print(f"知识库加载失败（不影响API启动）: {e}")
+    # 后台线程预热知识库：embedding 模型加载较慢，改为异步预热，
+    # 启动立即返回，首次检索请求由 ensure_loaded() 兜底（懒加载 + 锁）
+    print("正在后台预热知识库（不阻塞启动）...")
+    threading.Thread(target=ensure_loaded, daemon=True).start()
     print("启动完成！")
     yield  # 应用运行中
     print("应用关闭")
@@ -56,13 +61,67 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 请求级可观测性：记录每个请求的方法、路径、状态码、耗时
+api_logger = get_logger("tcm.api")
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    api_logger.info(
+        "%s %s -> %s (%.1fms)",
+        request.method, request.url.path, response.status_code,
+        (time.perf_counter() - start) * 1000,
+    )
+    return response
+
 # ==================== 用户管理 ====================
+
+def _hash_password(pw: str) -> str:
+    """密码 sha256 哈希（演示项目用，生产建议换 bcrypt）"""
+    return hashlib.sha256(pw.encode("utf-8")).hexdigest()
+
 
 @app.post("/api/users", response_model=UserResponse)
 def create_user(req: UserCreateRequest, db: Session = Depends(get_db)):
-    """创建新用户"""
+    """注册新用户（昵称唯一，密码 sha256 存储）。
+
+    兼容旧数据：若同名账号已存在但尚未设置密码（旧版"创建账号"遗留的重复账号），
+    则"认领"最近的一个——设置密码、复用原 user_id，让体质/画像/历史数据得以保留，
+    避免继续堆积第 N 个同名空账号。
+    """
+    if req.name:
+        exists = (
+            db.query(User)
+            .filter(User.name == req.name)
+            .order_by(User.created_at.desc())
+            .first()
+        )
+        if exists:
+            if exists.password:
+                raise HTTPException(status_code=409, detail="该昵称已被注册，请直接登录")
+            # 认领旧账号：补设密码，找回该账号既有数据
+            exists.password = _hash_password(req.password) if req.password else None
+            db.commit()
+            profile = db.query(HealthProfile).filter(HealthProfile.user_id == exists.id).first()
+            constitution = (
+                db.query(ConstitutionResult)
+                .filter(ConstitutionResult.user_id == exists.id)
+                .order_by(ConstitutionResult.created_at.desc())
+                .first()
+            )
+            return UserResponse(
+                id=exists.id,
+                name=exists.name,
+                has_profile=profile is not None,
+                has_constitution=constitution is not None,
+                constitution_type=constitution.constitution_type if constitution else None,
+            )
+
     user = User(
         name=req.name,
+        password=_hash_password(req.password) if req.password else None,
         gender=req.gender,
         birth_date=datetime.strptime(req.birth_date, "%Y-%m-%d").date() if req.birth_date else None,
     )
@@ -75,6 +134,42 @@ def create_user(req: UserCreateRequest, db: Session = Depends(get_db)):
         name=user.name,
         has_profile=False,
         has_constitution=False,
+    )
+
+
+@app.post("/api/auth/login", response_model=UserResponse)
+def login(req: LoginRequest, db: Session = Depends(get_db)):
+    """登录：校验昵称+密码，返回 user_id 及已有体质/画像状态。
+
+    注意：历史遗留了多个同名账号（旧版"创建账号"每次新建一条）。
+    这里必须优先匹配「已设置密码」的最新一条，否则会匹配到最旧的无密码记录，
+    导致注册时认领了最新账号、登录却校验了最旧账号的错位 bug。
+    """
+    user = (
+        db.query(User)
+        .filter(User.name == req.name, User.password.isnot(None))
+        .order_by(User.created_at.desc())
+        .first()
+    )
+    if not user:
+        exists = db.query(User).filter(User.name == req.name).first()
+        if exists:
+            raise HTTPException(status_code=401, detail="该账号是旧版账号（未设置密码），请用相同昵称重新注册以找回数据")
+        raise HTTPException(status_code=401, detail="账号不存在，请先注册")
+    if _hash_password(req.password) != user.password:
+        raise HTTPException(status_code=401, detail="密码错误")
+
+    profile = db.query(HealthProfile).filter(HealthProfile.user_id == user.id).first()
+    constitution = db.query(ConstitutionResult).filter(
+        ConstitutionResult.user_id == user.id
+    ).order_by(ConstitutionResult.created_at.desc()).first()
+
+    return UserResponse(
+        id=user.id,
+        name=user.name,
+        has_profile=profile is not None,
+        has_constitution=constitution is not None,
+        constitution_type=constitution.constitution_type if constitution else None,
     )
 
 
@@ -302,6 +397,27 @@ def chat_stream(req: ChatQueryRequest):
             "X-Accel-Buffering": "no",  # 禁用nginx缓冲
         },
     )
+
+
+# ==================== 多模态视觉分析（舌诊 / 体检报告） ====================
+
+@app.post("/api/vision/analyze", response_model=VisionResponse)
+def vision_analyze(req: VisionRequest):
+    """多模态接口：上传图片做舌诊或体检报告解析"""
+    db = SessionLocal()
+    user = db.query(User).filter(User.id == req.user_id).first()
+    db.close()
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在，请先创建用户")
+
+    try:
+        answer = analyze_image(req.image_data_url, req.task, req.message or "")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"图片分析失败: {str(e)}")
+
+    return VisionResponse(answer=answer, task=req.task, disclaimer=VISION_DISCLAIMER)
 
 
 # ==================== 对话历史 ====================

@@ -1,19 +1,36 @@
-fastapi==0.115.0
-uvicorn==0.30.0
+# ===== Web 框架 =====
+fastapi>=0.115.0
+uvicorn>=0.30.0
+streamlit>=1.60.0
+plotly>=5.23.0
+
+# ===== LangChain / Agent =====
 langchain>=0.3.0
 langchain-core>=0.3.0
 langchain-community>=0.3.0
 langgraph>=0.2.50
 langchain-ollama>=0.2.0
 langchain-openai>=0.3.0
-chromadb==0.5.0
-sentence-transformers==3.0.0
+
+# ===== 向量检索 / 嵌入 =====
+chromadb>=0.5.0
+sentence-transformers>=3.0.0
+
+# ===== 数据库 =====
 sqlalchemy==2.0.35
-psycopg2-binary==2.9.9
-pydantic==2.9.0
-pydantic-settings==2.5.0
-python-dotenv==1.0.1
-streamlit==1.38.0
-plotly==5.23.0
-openai==1.50.0
-httpx==0.27.0
+psycopg2-binary==2.9.9   # 仅生产 PostgreSQL 需要；本地 SQLite 可跳过
+
+# ===== 配置 / 校验 =====
+pydantic>=2.9.0
+pydantic-settings>=2.5.0
+python-dotenv>=1.0.1
+
+# ===== LLM / 多模态（DashScope 兼容模式）=====
+openai>=1.50.0
+httpx>=0.27.0
+
+# ===== MCP（模型上下文协议）=====
+mcp>=1.0.0
+
+# ===== 测试 =====
+pytest>=8.0.0

@@ -1,35 +1,46 @@
-"""LangGraph Agent路由：意图识别 → 多Tool调用 → 结果汇总"""
+"""LangGraph Agent：Function Calling（LLM 自主调工具）+ 并行工具执行 + Checkpoint 状态管理 + 医疗风控。
+
+架构演进：
+- 旧版：intent_classifier 用 if-elif 关键词硬编码路由到不同工具（串行）
+- 新版：LLM 通过 bind_tools 拿到工具 schema，根据语义自主决定调用哪些工具（可并行多调）
+- 新增：SqliteSaver checkpoint 状态持久化，支持断点续跑 / 时间旅行（thread_id 会话）
+"""
+import os
+import re
+import time
 from typing import List, Dict, Any, TypedDict, Annotated
+from concurrent.futures import ThreadPoolExecutor
+
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
-from langchain_core.documents import Document
-from langchain_openai import ChatOpenAI
-from .config import (
-    LLM_PROVIDER, DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL,
-    OLLAMA_HOST, OLLAMA_MODEL
+from langgraph.prebuilt import ToolNode
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langchain_core.messages import (
+    HumanMessage, AIMessage, SystemMessage, ToolMessage, BaseMessage,
 )
-from .safety import load_system_prompt, wrap_disclaimer
-from .rag_pipeline import search_knowledge, get_retrieval_context
+from .llm import get_llm
+from .memory import retrieve_memories, extract_and_save_memory, summarize_history
+from .safety import (
+    load_system_prompt, wrap_disclaimer,
+    is_medical_query, medical_reject_response,
+)
+from .tools import build_tools, TOOL_COLLECTIONS
 from .database import SessionLocal
-from .models import User, HealthProfile, ConstitutionResult, ChatHistory
-import json
+from .models import ChatHistory
+from .observability import get_logger
 
 
-# ========== LLM初始化 ==========
+# ========== Checkpoint 状态持久化 ==========
+# checkpoint 数据库文件（项目根，与 tcm_health.db 同级）
+_CHECKPOINT_DB = os.path.join(os.path.dirname(__file__), "..", "agent_checkpoints.db")
 
-def get_llm():
-    """根据配置返回LLM实例"""
-    if LLM_PROVIDER == "ollama":
-        from langchain_ollama import ChatOllama
-        return ChatOllama(model=OLLAMA_MODEL, base_url=OLLAMA_HOST, temperature=0.3)
-    else:
-        return ChatOpenAI(
-            api_key=DEEPSEEK_API_KEY,
-            base_url=DEEPSEEK_BASE_URL,
-            model=DEEPSEEK_MODEL,
-            temperature=0.3,
-        )
+
+def get_checkpointer():
+    """返回 SqliteSaver 上下文管理器：每次请求独立连接，状态持久化到文件。
+
+    用途：多轮对话状态持久化（服务重启不丢）、断点续跑、时间旅行回放。
+    """
+    return SqliteSaver.from_conn_string(_CHECKPOINT_DB)
 
 
 # ========== State定义 ==========
@@ -37,450 +48,339 @@ def get_llm():
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     user_id: str
-    intent: str
-    searched_collections: List[str]
-    tools_called: List[str]
-    retrieval_results: List[Dict]
-    user_profile: Dict
-    constitution: Dict
     final_answer: str
     sources: List[Dict]
     agent_trace: Dict
 
 
-# ========== Agent节点 ==========
+# 工具调用循环最大轮数（防止 LLM 反复调工具导致死循环）
+MAX_ITERATIONS = 5
 
-def intent_classifier(state: AgentState) -> AgentState:
-    """意图识别节点：分析用户想干什么"""
-    last_message = state["messages"][-1].content
+_DISCLAIMER = "⚠️ 以上为养生参考建议，不构成医疗诊断。如有身体不适，请及时前往正规医院就诊。"
 
-    # 用关键词+简单规则做意图分类（避免多一次LLM调用）
-    msg_lower = last_message.lower()
-
-    # 医疗意图检测（安全优先级最高）
-    medical_keywords = [
-        "吃什么药", "开个方子", "怎么治疗", "确诊", "治病", "处方",
-        "剂量", "能治好吗", "多久能好", "不吃药行吗", "手术", "打针",
-        "抗生素", "消炎药", "止疼药", "降压药", "降糖药"
-    ]
-    is_medical = any(kw in msg_lower for kw in medical_keywords)
-
-    if is_medical:
-        state["intent"] = "medical_reject"
-        state["tools_called"] = ["safety_filter"]
-        state["searched_collections"] = []
-    elif any(kw in msg_lower for kw in ["体质", "什么质", "辨识"]):
-        state["intent"] = "constitution"
-        state["tools_called"] = ["get_constitution"]
-        state["searched_collections"] = ["constitution"]
-    elif any(kw in msg_lower for kw in ["吃", "食谱", "食疗", "推荐", "喝什么", "茶", "汤"]):
-        state["intent"] = "diet_recommend"
-        state["tools_called"] = ["get_user_profile", "search_diet", "search_herbs"]
-        state["searched_collections"] = ["diet", "herbs"]
-    elif any(kw in msg_lower for kw in ["方剂", "方子", "配伍", "配方", "汤剂"]):
-        state["intent"] = "formula_query"
-        state["tools_called"] = ["search_formulas", "search_herbs"]
-        state["searched_collections"] = ["formulas", "herbs"]
-    elif any(kw in msg_lower for kw in ["中药", "药材", "黄芪", "当归", "人参", "枸杞",
-                                          "菊花", "陈皮", "茯苓", "党参", "阿胶"]):
-        state["intent"] = "herb_query"
-        state["tools_called"] = ["search_herbs"]
-        state["searched_collections"] = ["herbs"]
-    else:
-        state["intent"] = "general_knowledge"
-        state["tools_called"] = ["search_all_knowledge"]
-        state["searched_collections"] = ["herbs", "formulas", "diet", "constitution"]
-
-    return state
+# Agent 调用链路日志（结构化，便于追溯每次调用的工具与检索库）
+agent_logger = get_logger("tcm.agent")
 
 
-def medical_reject(state: AgentState) -> AgentState:
-    """医疗问题拒绝节点"""
-    last_message = state["messages"][-1].content
-    # 提取可能的养生话题用于引导
-    health_topics = {
-        "头疼": "头痛的日常调理和穴位按摩",
-        "失眠": "改善睡眠的食疗和养生方法",
-        "胃": "脾胃调理的饮食建议",
-        "湿气": "祛湿的日常方法",
-        "感冒": "增强免疫力的养生方式",
-        "咳嗽": "润肺的食疗推荐",
-    }
-    guide = "中医养生知识"
-    for keyword, topic in health_topics.items():
-        if keyword in last_message:
-            guide = topic
-            break
+# ========== 消息构建 ==========
 
-    state["final_answer"] = (
-        f"关于疾病治疗和用药问题，我无法提供医疗建议。建议您咨询正规医院的中医师。\n\n"
-        f"我可以为您介绍相关的养生知识——比如{guide}。您想了解哪方面呢？\n\n"
-        f"---\n"
-        f"⚠️ 以上为养生参考建议，不构成医疗诊断。如有身体不适，请及时前往正规医院就诊。"
-    )
-    state["sources"] = []
-    return state
+# 摘要触发阈值：历史超过 12 条（6 轮）才把更早的消息压缩成摘要
+_SUMMARY_TRIGGER = 12
 
 
-def retrieve_user_data(state: AgentState) -> AgentState:
-    """获取用户画像和体质信息"""
-    user_id = state["user_id"]
-    db = SessionLocal()
-    try:
-        # 获取最近一次体质结果
-        constitution = db.query(ConstitutionResult).filter(
-            ConstitutionResult.user_id == user_id
-        ).order_by(ConstitutionResult.created_at.desc()).first()
+def build_messages(message: str, conversation_history: List[Dict] = None,
+                   summary: str = "") -> List[BaseMessage]:
+    """构建对话消息（不含 System Prompt，system 由 call_model / 流式路径动态注入）。
 
-        # 获取健康画像
-        profile = db.query(HealthProfile).filter(
-            HealthProfile.user_id == user_id
-        ).first()
-
-        if constitution:
-            state["constitution"] = {
-                "type": constitution.constitution_type,
-                "scores": constitution.scores,
-            }
-        else:
-            state["constitution"] = {}
-
-        if profile:
-            state["user_profile"] = {
-                "height_cm": profile.height_cm,
-                "weight_kg": profile.weight_kg,
-                "bmi": profile.bmi,
-                "sleep_quality": profile.sleep_quality,
-                "exercise_frequency": profile.exercise_frequency,
-            }
-        else:
-            state["user_profile"] = {}
-    finally:
-        db.close()
-    return state
-
-
-def search_tools(state: AgentState) -> AgentState:
-    """执行知识库检索"""
-    collections = state.get("searched_collections", [])
-    last_message = state["messages"][-1].content
-    results = search_knowledge(last_message, collections)
-    state["retrieval_results"] = results
-
-    # 格式化sources用于返回
-    state["sources"] = [
-        {"doc": r["doc"], "excerpt": r["excerpt"][:200]}
-        for r in results
-    ]
-    return state
-
-
-def generate_answer(state: AgentState) -> AgentState:
-    """调用LLM生成回答"""
-    intent = state["intent"]
-    results = state.get("retrieval_results", [])
-    constitution = state.get("constitution", {})
-    profile = state.get("user_profile", {})
-
-    # 构建上下文
-    context = get_retrieval_context(results)
-
-    # 构建用户信息提示
-    user_info = ""
-    if constitution:
-        user_info += f"\n用户体质类型：{constitution.get('type', '未知')}"
-    if profile:
-        bmi = profile.get("bmi", "")
-        bmi_str = f"{bmi:.1f}" if bmi else "未录入"
-        user_info += f"\n身高：{profile.get('height_cm', '未录入')}cm"
-        user_info += f"\n体重：{profile.get('weight_kg', '未录入')}kg"
-        user_info += f"\nBMI：{bmi_str}"
-    if not user_info:
-        user_info = "\n（用户尚未完成体质辨识和健康画像，可建议其先完成问卷）"
-
-    system_prompt = load_system_prompt() + f"\n\n## 当前用户信息{user_info}"
-
-    # 构建消息列表
-    messages = [HumanMessage(content=system_prompt)]
-    messages.extend(state["messages"])
-
-    llm = get_llm()
-    # 附加上下文
-    if context and context != "（知识库中未找到相关信息）":
-        augmented_message = HumanMessage(content=f"请基于以下知识库内容回答问题：\n\n{context}\n\n用户问题：{state['messages'][-1].content}")
-        messages = [HumanMessage(content=system_prompt), augmented_message]
-    else:
-        messages = [HumanMessage(content=system_prompt), state["messages"][-1]]
-
-    response = llm.invoke(messages)
-    answer = response.content
-
-    # 包装免责声明
-    state["final_answer"] = wrap_disclaimer(answer)
-    state["agent_trace"] = {
-        "intent": intent,
-        "searched_collections": state.get("searched_collections", []),
-        "tools_called": state.get("tools_called", []),
-    }
-    return state
-
-
-def save_chat_history(state: AgentState) -> AgentState:
-    """保存对话记录到数据库"""
-    user_id = state["user_id"]
-    db = SessionLocal()
-    try:
-        # 保存用户消息
-        user_msg = ChatHistory(
-            user_id=user_id,
-            role="user",
-            message=state["messages"][-1].content,
-        )
-        db.add(user_msg)
-
-        # 保存AI回复
-        ai_msg = ChatHistory(
-            user_id=user_id,
-            role="assistant",
-            message=state["final_answer"],
-            sources=state.get("sources"),
-            agent_trace=state.get("agent_trace"),
-        )
-        db.add(ai_msg)
-        db.commit()
-    finally:
-        db.close()
-    return state
-
-
-# ========== 构建Agent图 ==========
-
-def build_agent():
-    """构建LangGraph Agent"""
-    workflow = StateGraph(AgentState)
-
-    # 添加节点
-    workflow.add_node("classify", intent_classifier)
-    workflow.add_node("medical_reject", medical_reject)
-    workflow.add_node("retrieve_user", retrieve_user_data)
-    workflow.add_node("search", search_tools)
-    workflow.add_node("generate", generate_answer)
-    workflow.add_node("save", save_chat_history)
-
-    # 设置入口
-    workflow.set_entry_point("classify")
-
-    # 条件路由：医疗意图直接拒绝
-    def route_after_classify(state: AgentState) -> str:
-        if state["intent"] == "medical_reject":
-            return "medical_reject"
-        return "retrieve_user"
-
-    workflow.add_conditional_edges("classify", route_after_classify, {
-        "medical_reject": "medical_reject",
-        "retrieve_user": "retrieve_user",
-    })
-
-    # 正常流程
-    workflow.add_edge("retrieve_user", "search")
-    workflow.add_edge("search", "generate")
-    workflow.add_edge("generate", "save")
-    workflow.add_edge("save", END)
-
-    # 拒绝流程直接结束
-    workflow.add_edge("medical_reject", "save")
-    # 注意：medical_reject → save 然后 save → END
-
-    return workflow.compile()
-
-
-# 全局Agent实例
-_agent = None
-
-
-def get_agent():
-    """获取Agent实例（懒加载）"""
-    global _agent
-    if _agent is None:
-        _agent = build_agent()
-    return _agent
-
-
-def run_agent(user_id: str, message: str, conversation_history: List[Dict] = None) -> Dict:
-    """执行Agent
-
-    Args:
-        user_id: 用户ID
-        message: 用户消息
-        conversation_history: [{"role": "user/assistant", "message": "..."}]
-
-    Returns:
-        {"answer": "...", "sources": [...], "agent_trace": {...}, "disclaimer": "..."}
+    summary 非空时，作为「摘要记忆」以独立 SystemMessage 注入到窗口历史之前。
+    这样 checkpoint 里只累积纯对话，不会重复堆叠 system prompt。
     """
-    agent = get_agent()
-
-    # 构建历史消息
-    messages = []
+    messages: List[BaseMessage] = []
+    if summary:
+        messages.append(SystemMessage(content=f"[对话历史摘要]\n{summary}"))
     if conversation_history:
-        for h in conversation_history[-6:]:  # 只保留最近3轮（6条消息）
+        for h in conversation_history[-6:]:  # 只保留最近3轮（6条消息）——窗口记忆
             if h["role"] == "user":
                 messages.append(HumanMessage(content=h["message"]))
             else:
                 messages.append(AIMessage(content=h["message"]))
     messages.append(HumanMessage(content=message))
+    return messages
 
-    # 执行Agent
-    initial_state: AgentState = {
-        "messages": messages,
+
+def _with_system(messages: List[BaseMessage]) -> List[BaseMessage]:
+    """在消息列表前注入 System Prompt"""
+    return [SystemMessage(content=load_system_prompt())] + list(messages)
+
+
+def _system_with_memory(user_id: str, query: str) -> str:
+    """构建带「向量记忆」的 System Prompt：基础系统提示 + 语义召回的该用户历史记忆"""
+    base = load_system_prompt()
+    memories = retrieve_memories(user_id, query, top_k=3)
+    if memories:
+        base += "\n\n## 用户历史记忆（你与用户过往对话中记住的信息，回答时可自然引用）\n" + \
+                "\n".join(f"- {m}" for m in memories)
+    return base
+
+
+def _build_summary(conversation_history: List[Dict]) -> str:
+    """对话超过阈值时，把更早的旧消息压缩成摘要（解决长对话 token 膨胀）。
+
+    生产优化点：摘要应在历史变化时才重算并缓存，这里为可读性每次现算，
+    仅在超过阈值时触发，避免常规短对话多一次 LLM 调用。
+    """
+    if not conversation_history or len(conversation_history) <= _SUMMARY_TRIGGER:
+        return ""
+    return summarize_history(conversation_history, keep_recent=6)
+
+
+# ========== 工具执行（并行）==========
+
+def execute_tools_parallel(tools, tool_calls) -> List[ToolMessage]:
+    """并行执行多个工具调用，返回 ToolMessage 列表。
+
+    LLM 一次返回多个 tool_calls 时（如同时检索食疗+体质+中药），
+    用线程池并发执行，而不是串行等待，这就是「多工具链并行编排」。
+    """
+    tool_map = {t.name: t for t in tools}
+
+    def run_one(tc):
+        t = tool_map[tc["name"]]
+        result = t.invoke(tc["args"])
+        return ToolMessage(content=str(result), tool_call_id=tc["id"], name=tc["name"])
+
+    if len(tool_calls) == 1:
+        return [run_one(tool_calls[0])]
+    with ThreadPoolExecutor(max_workers=len(tool_calls)) as ex:
+        return list(ex.map(run_one, tool_calls))
+
+
+# ========== sources / trace 提取 ==========
+
+_SOURCE_PATTERN = re.compile(
+    r"\[来源\d+\]\s*(.+?)（相关度:\s*[\d.]+\）\n(.+?)(?=\n\n\[来源\d+\]|\Z)",
+    re.DOTALL,
+)
+
+
+def extract_sources(messages: List[BaseMessage]) -> List[Dict]:
+    """从工具返回结果中提取结构化引用来源（doc + excerpt），供前端展示与持久化"""
+    sources = []
+    seen = set()
+    for m in messages:
+        if not isinstance(m, ToolMessage):
+            continue
+        content = m.content or ""
+        for doc, excerpt in _SOURCE_PATTERN.findall(content):
+            doc = doc.strip()
+            if doc in seen:
+                continue
+            seen.add(doc)
+            sources.append({"doc": doc, "excerpt": excerpt.strip()[:200]})
+    return sources
+
+
+def build_trace(messages: List[BaseMessage]) -> Dict:
+    """从消息列表重建 Agent 调用链路（便于调试追溯 + 前端展示）"""
+    tools_called = []
+    for m in messages:
+        if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+            for tc in m.tool_calls:
+                tools_called.append(tc["name"])
+
+    searched_collections = []
+    for name in tools_called:
+        for col in TOOL_COLLECTIONS.get(name, []):
+            if col not in searched_collections:
+                searched_collections.append(col)
+
+    return {
+        "mode": "function_calling",
+        "tools_called": tools_called,
+        "searched_collections": searched_collections,
+    }
+
+
+# ========== LangGraph 图（Function Calling 循环）==========
+
+def build_agent(user_id: str, checkpointer=None, system: str = None):
+    """构建 Function Calling Agent 图：agent(LLM决策) ⇄ tools(并行执行)
+
+    图结构：
+        entry → agent ──有 tool_calls──→ tools → agent（循环）
+                  └──无 tool_calls──→ END
+
+    checkpointer 传入时，图按 thread_id 持久化状态，支持断点续跑/时间旅行。
+    system 传入时作为 System Prompt（可带长期记忆），否则用默认系统提示。
+    """
+    tools = build_tools(user_id)
+    system = system or load_system_prompt()
+
+    def call_model(state: AgentState) -> Dict:
+        """agent 节点：LLM bind_tools，根据语义自主决定调用哪些工具"""
+        llm = get_llm().bind_tools(tools)
+        response = llm.invoke([SystemMessage(content=system)] + list(state["messages"]))
+        return {"messages": [response]}
+
+    def should_continue(state: AgentState) -> str:
+        """条件路由：最后一条 AI 消息含 tool_calls 则继续调工具，否则结束"""
+        last = state["messages"][-1]
+        if isinstance(last, AIMessage) and getattr(last, "tool_calls", None):
+            return "tools"
+        return END
+
+    workflow = StateGraph(AgentState)
+    workflow.add_node("agent", call_model)
+    workflow.add_node("tools", ToolNode(tools))
+    workflow.set_entry_point("agent")
+    workflow.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
+    workflow.add_edge("tools", "agent")
+    return workflow.compile(checkpointer=checkpointer)
+
+
+# ========== 对话持久化 ==========
+
+def save_chat_history(user_id: str, user_message: str, answer: str,
+                      sources: List[Dict], agent_trace: Dict):
+    """保存对话记录到数据库"""
+    db = SessionLocal()
+    try:
+        db.add(ChatHistory(user_id=user_id, role="user", message=user_message))
+        db.add(ChatHistory(
+            user_id=user_id, role="assistant", message=answer,
+            sources=sources, agent_trace=agent_trace,
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+
+# ========== 非流式执行（走 LangGraph 图）==========
+
+def run_agent(user_id: str, message: str, conversation_history: List[Dict] = None,
+              thread_id: str = None) -> Dict:
+    """执行Agent（非流式）：医疗风控前置拦截 → Function Calling 图 → 持久化
+
+    Args:
+        user_id: 用户ID
+        message: 用户消息
+        conversation_history: 传统模式的历史消息（前端传参）
+        thread_id: checkpoint 模式会话ID；传入时历史由 checkpointer 恢复，忽略 conversation_history
+
+    Returns:
+        {"answer": "...", "sources": [...], "agent_trace": {...}, "disclaimer": "..."}
+    """
+    start = time.perf_counter()
+    # 医疗意图快速拦截（确定性安全过滤，第一道防线）
+    if is_medical_query(message):
+        answer = wrap_disclaimer(medical_reject_response(message))
+        trace = {"mode": "function_calling", "tools_called": ["safety_filter"], "searched_collections": []}
+        save_chat_history(user_id, message, answer, [], trace)
+        agent_logger.info("agent_call user=%s tools=[safety_filter] collections=[] duration=%.0fms",
+                          user_id, (time.perf_counter() - start) * 1000)
+        return {"answer": answer, "sources": [], "agent_trace": trace, "disclaimer": _DISCLAIMER}
+
+    initial: AgentState = {
+        "messages": [],
         "user_id": user_id,
-        "intent": "",
-        "searched_collections": [],
-        "tools_called": [],
-        "retrieval_results": [],
-        "user_profile": {},
-        "constitution": {},
         "final_answer": "",
         "sources": [],
         "agent_trace": {},
     }
 
-    result = agent.invoke(initial_state)
+    if thread_id:
+        # checkpoint 模式：历史由 checkpointer 恢复，只传当前消息
+        with get_checkpointer() as checkpointer:
+            agent = build_agent(user_id, checkpointer=checkpointer,
+                                system=_system_with_memory(user_id, message))
+            initial["messages"] = build_messages(message)
+            config = {"configurable": {"thread_id": thread_id}}
+            result = agent.invoke(initial, config)
+    else:
+        # 传统模式：前端传 conversation_history
+        summary = _build_summary(conversation_history)
+        agent = build_agent(user_id, system=_system_with_memory(user_id, message))
+        initial["messages"] = build_messages(message, conversation_history, summary=summary)
+        result = agent.invoke(initial)
+
+    all_messages = result["messages"]
+    raw_answer = all_messages[-1].content
+    final_answer = wrap_disclaimer(raw_answer)
+    sources = extract_sources(all_messages)
+    agent_trace = build_trace(all_messages)
+
+    save_chat_history(user_id, message, final_answer, sources, agent_trace)
+
+    # 长期记忆：提取并保存本轮记忆点（生产应异步化，这里同步 + 兜底）
+    extract_and_save_memory(user_id, message, raw_answer)
+
+    agent_logger.info("agent_call user=%s tools=%s collections=%s duration=%.0fms",
+                      user_id, agent_trace["tools_called"], agent_trace["searched_collections"],
+                      (time.perf_counter() - start) * 1000)
 
     return {
-        "answer": result["final_answer"],
-        "sources": result["sources"],
-        "agent_trace": result["agent_trace"],
-        "disclaimer": "⚠️ 以上为养生参考建议，不构成医疗诊断。如有身体不适，请及时前往正规医院就诊。",
+        "answer": final_answer,
+        "sources": sources,
+        "agent_trace": agent_trace,
+        "disclaimer": _DISCLAIMER,
     }
 
 
-# ========== 流式输出支持 ==========
-
-def _build_llm_messages(state: AgentState):
-    """构建LLM调用的消息列表，与 generate_answer 节点逻辑一致"""
-    results = state.get("retrieval_results", [])
-    constitution = state.get("constitution", {})
-    profile = state.get("user_profile", {})
-
-    context = get_retrieval_context(results)
-
-    # 构建用户信息提示
-    user_info = ""
-    if constitution:
-        user_info += f"\n用户体质类型：{constitution.get('type', '未知')}"
-    if profile:
-        bmi = profile.get("bmi", "")
-        bmi_str = f"{bmi:.1f}" if bmi else "未录入"
-        user_info += f"\n身高：{profile.get('height_cm', '未录入')}cm"
-        user_info += f"\n体重：{profile.get('weight_kg', '未录入')}kg"
-        user_info += f"\nBMI：{bmi_str}"
-    if not user_info:
-        user_info = "\n（用户尚未完成体质辨识和健康画像，可建议其先完成问卷）"
-
-    system_prompt = load_system_prompt() + f"\n\n## 当前用户信息{user_info}"
-
-    if context and context != "（知识库中未找到相关信息）":
-        augmented_message = HumanMessage(
-            content=f"请基于以下知识库内容回答问题：\n\n{context}\n\n用户问题：{state['messages'][-1].content}"
-        )
-        return [HumanMessage(content=system_prompt), augmented_message]
-    else:
-        return [HumanMessage(content=system_prompt), state["messages"][-1]]
-
+# ========== 流式执行（手动 Tool Calling 循环 + 流式生成）==========
 
 def run_agent_stream(user_id: str, message: str, conversation_history: List[Dict] = None):
-    """流式执行Agent——逐token返回，供SSE推流使用。
+    """流式执行Agent——逐token返回，供SSE推流使用（打字机效果）。
 
-    不走LangGraph完整图，而是手动串联 classify→retrieve_user→search→LLM.stream→save，
-    好处是生成阶段可以用 ChatOpenAI.stream() 逐token产出，实现打字机效果。
+    与 run_agent 走 LangGraph 图不同，这里手动串联同样的 Function Calling 逻辑，
+    目的是让最终答案生成阶段可以用 llm.stream() 逐 token 产出：
+      阶段1 工具调用循环：非流式 invoke 快速决策调哪些工具 + 并行执行
+      阶段2 最终生成：llm.stream 逐 token 推流
 
     Yields:
         {"type": "token", "content": "文"}   # 增量token
         {"type": "done", "sources": [...], "agent_trace": {...}}  # 结束标记+元数据
     """
-    # ---- Step 1: 构建消息列表（与 run_agent 保持一致）----
-    messages = []
-    if conversation_history:
-        for h in conversation_history[-6:]:  # 最近3轮
-            if h["role"] == "user":
-                messages.append(HumanMessage(content=h["message"]))
-            else:
-                messages.append(AIMessage(content=h["message"]))
-    messages.append(HumanMessage(content=message))
-
-    # ---- Step 2: 意图识别 ----
-    state: AgentState = {
-        "messages": messages,
-        "user_id": user_id,
-        "intent": "",
-        "searched_collections": [],
-        "tools_called": [],
-        "retrieval_results": [],
-        "user_profile": {},
-        "constitution": {},
-        "final_answer": "",
-        "sources": [],
-        "agent_trace": {},
-    }
-    state = intent_classifier(state)
-
-    # ---- Step 3: 医疗意图直接拒绝（非流式）----
-    if state["intent"] == "medical_reject":
-        state = medical_reject(state)
-        save_chat_history(state)
-        yield {"type": "token", "content": state["final_answer"]}
-        yield {
-            "type": "done",
-            "sources": [],
-            "agent_trace": state.get("agent_trace", {}),
-        }
+    start = time.perf_counter()
+    # 医疗意图快速拦截
+    if is_medical_query(message):
+        answer = wrap_disclaimer(medical_reject_response(message))
+        trace = {"mode": "function_calling", "tools_called": ["safety_filter"], "searched_collections": []}
+        save_chat_history(user_id, message, answer, [], trace)
+        agent_logger.info("agent_stream user=%s tools=[safety_filter] collections=[] duration=%.0fms",
+                          user_id, (time.perf_counter() - start) * 1000)
+        yield {"type": "token", "content": answer}
+        yield {"type": "done", "sources": [], "agent_trace": trace}
         return
 
-    # ---- Step 4: 获取用户画像 ----
-    state = retrieve_user_data(state)
+    tools = build_tools(user_id)
+    llm_with_tools = get_llm().bind_tools(tools)
+    summary = _build_summary(conversation_history)
+    messages = [SystemMessage(content=_system_with_memory(user_id, message))] + \
+               build_messages(message, conversation_history, summary=summary)
 
-    # ---- Step 5: 知识库检索 ----
-    state = search_tools(state)
+    # 阶段1：工具调用循环（非流式，快速）
+    # 推一个状态事件，消除"等待期无反馈"的空窗（用户在 6 秒决策期内看到进度）
+    yield {"type": "status", "content": "🧠 正在理解您的问题…\n\n"}
+    for _ in range(MAX_ITERATIONS):
+        ai_msg = llm_with_tools.invoke(messages)
+        if not getattr(ai_msg, "tool_calls", None):
+            break
+        messages.append(ai_msg)
+        yield {"type": "status", "content": "🔍 正在检索中医知识库…\n\n"}
+        messages.extend(execute_tools_parallel(tools, ai_msg.tool_calls))
 
-    # ---- Step 6: 构建LLM消息 ----
-    llm_messages = _build_llm_messages(state)
-
-    # ---- Step 7: 流式调用LLM ----
+    # 阶段2：流式生成最终答案（不带工具，专注生成）
     llm = get_llm()
     full_response = ""
     try:
-        for chunk in llm.stream(llm_messages):
+        for chunk in llm.stream(messages):
             token = chunk.content
-            if token:  # 过滤空chunk
+            if token:
                 full_response += token
                 yield {"type": "token", "content": token}
     except Exception as e:
-        error_msg = f"\n\n[生成中断: {str(e)}]"
-        full_response += error_msg
-        yield {"type": "token", "content": error_msg}
+        err = f"\n\n[生成中断: {str(e)}]"
+        full_response += err
+        yield {"type": "token", "content": err}
 
-    # ---- Step 8: 追加免责声明 ----
+    # 追加免责声明
     final_answer = wrap_disclaimer(full_response)
     disclaimer_suffix = final_answer[len(full_response):]
     if disclaimer_suffix:
         yield {"type": "token", "content": disclaimer_suffix}
 
-    # ---- Step 9: 保存对话记录 ----
-    state["final_answer"] = final_answer
-    state["sources"] = [
-        {"doc": r["doc"], "excerpt": r["excerpt"][:200]}
-        for r in state.get("retrieval_results", [])
-    ]
-    state["agent_trace"] = {
-        "intent": state["intent"],
-        "searched_collections": state.get("searched_collections", []),
-        "tools_called": state.get("tools_called", []),
-    }
-    save_chat_history(state)
+    # 提取 sources + 调用链路
+    sources = extract_sources(messages)
+    agent_trace = build_trace(messages)
 
-    # ---- Step 10: 推送完成信号 ----
-    yield {
-        "type": "done",
-        "sources": state["sources"],
-        "agent_trace": state["agent_trace"],
-    }
+    # 持久化
+    save_chat_history(user_id, message, final_answer, sources, agent_trace)
+
+    # 长期记忆：提取并保存本轮记忆点
+    extract_and_save_memory(user_id, message, full_response)
+
+    agent_logger.info("agent_stream user=%s tools=%s collections=%s duration=%.0fms",
+                      user_id, agent_trace["tools_called"], agent_trace["searched_collections"],
+                      (time.perf_counter() - start) * 1000)
+
+    yield {"type": "done", "sources": sources, "agent_trace": agent_trace}
